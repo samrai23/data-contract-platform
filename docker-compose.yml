@@ -74,6 +74,7 @@ services:
       PUBSUB_EMULATOR_HOST: pubsub-emulator:8085
       MCP_SERVER_URL: http://mcp-server:8001
       CONTRACT_API_URL: http://contract-api:8000
+      GOOGLE_APPLICATION_CREDENTIALS: /app/gcp-credentials.json
     volumes:
       - ./services/agent_engine:/app
       - ./guardrails:/app/guardrails
