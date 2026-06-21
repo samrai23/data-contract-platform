@@ -61,3 +61,6 @@ metastore_db/
 *.json.gz
 data/raw/
 data/processed/
+
+# Personal notes — never push to GitHub
+notes/

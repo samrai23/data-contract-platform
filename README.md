@@ -2,8 +2,6 @@
 
 > **Auto-detects vendor schema drift in real-time, classifies it, and either heals the pipeline autonomously or escalates to a human — with guardrails preventing any destructive operation.**
 
-Built for Delhi NCR data engineering interviews. Mirrors the real problem at Cars24, Paytm, Policybazaar, and MakeMyTrip — all of whom ingest from dozens of external vendors daily.
-
 ---
 
 ## The Problem This Solves
@@ -418,13 +416,7 @@ The NeMo Guardrails Colang policies enforce:
 
 ---
 
-## Interview Story (memorise this)
-
-> "Vendor schema drift was the #1 cause of pipeline failures — a vendor changes `user_id` from INT to STRING without warning and your entire pipeline crashes. I built a LangGraph 3-agent system: the first agent reads the drift event via an MCP tool server and classifies severity; the second generates an updated data contract using a structured few-shot prompt — NeMo Guardrails ensures it never outputs DROP or DELETE; the third either auto-heals the BigQuery schema and restarts the pipeline, or routes to human approval for risky changes. PySpark Structured Streaming detects the drift in real-time from Kafka, dbt enforces the contract at the transformation layer, and Great Expectations validates the healed data before it touches production. 84% of drifts were auto-healed in under 90 seconds."
-
----
-
 ## Author
 
-**Your Name** | Data Engineer | Delhi NCR
-[LinkedIn](https://linkedin.com/in/yourprofile) · [GitHub](https://github.com/yourusername)
+**Sudhanshu Raina** | Data Engineer | Delhi NCR
+[LinkedIn](https://www.linkedin.com/in/sudhanshu-raina-39a939189/) · [GitHub](https://github.com/samrai23)
