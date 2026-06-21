@@ -1,0 +1,47 @@
+{
+  "vendor_id": "cars24",
+  "version": "1.0.0",
+  "status": "active",
+  "description": "Car listing feed from Cars24. Sent daily via Pub/Sub vendor-feeds topic.",
+  "owner_email": "data-ingestion@cars24.com",
+  "created_at": "2024-01-01T00:00:00Z",
+  "updated_at": "2024-01-01T00:00:00Z",
+  "fields": [
+    {
+      "name": "vehicle_id",
+      "field_type": "STRING",
+      "nullable": false,
+      "description": "Unique vehicle identifier e.g. CAR12345"
+    },
+    {
+      "name": "user_id",
+      "field_type": "INT",
+      "nullable": false,
+      "description": "Seller user ID (32-bit integer)"
+    },
+    {
+      "name": "price",
+      "field_type": "DOUBLE",
+      "nullable": true,
+      "description": "Listing price in INR"
+    },
+    {
+      "name": "listing_date",
+      "field_type": "TIMESTAMP",
+      "nullable": false,
+      "description": "UTC timestamp when the listing was created"
+    },
+    {
+      "name": "city",
+      "field_type": "STRING",
+      "nullable": true,
+      "description": "City where the vehicle is listed"
+    },
+    {
+      "name": "fuel_type",
+      "field_type": "STRING",
+      "nullable": true,
+      "description": "Petrol / Diesel / CNG / Electric"
+    }
+  ]
+}

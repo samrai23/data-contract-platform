@@ -1,0 +1,18 @@
+# FastAPI web framework and ASGI server
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+
+# BigQuery client — the [bignumeric] extra adds support for NUMERIC/BIGNUMERIC types
+google-cloud-bigquery>=3.20.0
+db-dtypes>=1.2.0          # Required for BigQuery → pandas/arrow type conversions
+
+# Pydantic v2 for request/response validation
+pydantic>=2.7.0
+pydantic-settings>=2.2.0
+email-validator>=2.1.0    # Required for EmailStr field type in Pydantic
+
+# Structured logging
+structlog>=24.1.0
+
+# Loads .env file automatically in local mode
+python-dotenv>=1.0.0

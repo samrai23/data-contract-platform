@@ -1,0 +1,112 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────
+# LOCAL DEVELOPMENT STACK
+# Runs everything locally. Cloud services (BigQuery, Confluent)
+# are accessed via env vars — only local infra is here.
+# ─────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Pub/Sub Emulator (replaces Kafka + Zookeeper for local dev) ────────
+  # The official Google Cloud SDK image includes the Pub/Sub emulator.
+  # Services connect to this instead of real GCP when PUBSUB_EMULATOR_HOST is set.
+  pubsub-emulator:
+    image: gcr.io/google.com/cloudsdktool/cloud-sdk:latest
+    container_name: pubsub-emulator
+    ports:
+      - "8085:8085"
+    # Call the Java emulator binary directly with --host=0.0.0.0 so it binds
+    # to all interfaces, not just container-internal localhost.
+    # gcloud beta emulators pubsub start always passes --host=localhost to the
+    # binary regardless of --host-port, making the emulator unreachable from
+    # outside the container.
+    command: >
+      /usr/lib/google-cloud-sdk/platform/pubsub-emulator/bin/cloud-pubsub-emulator
+      --host=0.0.0.0
+      --port=8085
+    healthcheck:
+      # bash /dev/tcp is a built-in TCP check — no nc/curl needed in the image
+      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/localhost/8085' && exit 0 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ── Contract API (FastAPI) ──────────────────────────────────────────────
+  contract-api:
+    build:
+      context: ./services/contract_api
+      dockerfile: Dockerfile
+    container_name: contract-api
+    ports:
+      - "8000:8000"
+    env_file: .env
+    volumes:
+      - ./services/contract_api:/app
+      - ./data_contracts:/app/data_contracts
+      - ./gcp-credentials.json:/app/gcp-credentials.json:ro
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  # ── MCP Server ──────────────────────────────────────────────
+  mcp-server:
+    build:
+      context: ./services/mcp_server
+      dockerfile: Dockerfile
+    container_name: mcp-server
+    ports:
+      - "8001:8001"
+    env_file: .env
+    volumes:
+      - ./services/mcp_server:/app
+      - ./gcp-credentials.json:/app/gcp-credentials.json:ro
+    command: python server.py
+
+  # ── Agent Engine (LangGraph) ────────────────────────────────────────────
+  agent-engine:
+    build:
+      context: ./services/agent_engine
+      dockerfile: Dockerfile
+    container_name: agent-engine
+    ports:
+      - "8002:8002"
+    env_file: .env
+    environment:
+      PUBSUB_EMULATOR_HOST: pubsub-emulator:8085
+      MCP_SERVER_URL: http://mcp-server:8001
+      CONTRACT_API_URL: http://contract-api:8000
+    volumes:
+      - ./services/agent_engine:/app
+      - ./guardrails:/app/guardrails
+      - ./gcp-credentials.json:/app/gcp-credentials.json:ro
+    depends_on:
+      pubsub-emulator:
+        condition: service_healthy
+      mcp-server:
+        condition: service_started
+      contract-api:
+        condition: service_started
+
+  # ── Drift Detector ───────────────────────────────────────────────────────
+  drift-detector:
+    build:
+      context: ./services/drift_detector
+      dockerfile: Dockerfile
+    container_name: drift-detector
+    env_file: .env
+    environment:
+      PUBSUB_EMULATOR_HOST: pubsub-emulator:8085
+      CONTRACT_API_URL: http://contract-api:8000
+    volumes:
+      - ./services/drift_detector:/app
+      - ./spark_jobs:/app/spark_jobs
+      - ./data_contracts:/app/data_contracts
+      - ./gcp-credentials.json:/app/gcp-credentials.json:ro
+    depends_on:
+      pubsub-emulator:
+        condition: service_healthy
+      agent-engine:
+        condition: service_started
+
+networks:
+  default:
+    name: data-contract-network

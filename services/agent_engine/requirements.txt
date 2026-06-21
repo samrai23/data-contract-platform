@@ -1,0 +1,11 @@
+langgraph>=0.2
+langchain-google-genai>=2.0
+langchain-core>=0.3
+google-cloud-pubsub
+google-cloud-bigquery
+db-dtypes
+httpx
+structlog
+python-dotenv
+pydantic
+pydantic-settings

@@ -1,0 +1,42 @@
+{
+  "_comment": "Base template for a vendor data contract. Copy this file to data_contracts/registry/{vendor_id}.json and fill in your values.",
+  "vendor_id": "your-vendor-id",
+  "version": "1.0.0",
+  "status": "active",
+  "description": "Brief description of what data this vendor provides",
+  "owner_email": "data-team@yourcompany.com",
+  "created_at": "2024-01-01T00:00:00Z",
+  "updated_at": "2024-01-01T00:00:00Z",
+  "fields": [
+    {
+      "name": "record_id",
+      "field_type": "STRING",
+      "nullable": false,
+      "description": "Unique identifier for this record"
+    },
+    {
+      "name": "user_id",
+      "field_type": "INT",
+      "nullable": false,
+      "description": "Internal user identifier"
+    },
+    {
+      "name": "amount",
+      "field_type": "DOUBLE",
+      "nullable": true,
+      "description": "Transaction amount in INR"
+    },
+    {
+      "name": "status",
+      "field_type": "STRING",
+      "nullable": true,
+      "description": "Current status of the record"
+    },
+    {
+      "name": "created_at",
+      "field_type": "TIMESTAMP",
+      "nullable": false,
+      "description": "UTC timestamp when the record was created"
+    }
+  ]
+}

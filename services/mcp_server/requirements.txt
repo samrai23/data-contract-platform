@@ -1,0 +1,8 @@
+fastmcp>=2.0
+httpx
+google-cloud-bigquery
+db-dtypes
+pydantic
+pydantic-settings
+structlog
+python-dotenv

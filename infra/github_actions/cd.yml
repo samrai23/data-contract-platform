@@ -1,0 +1,61 @@
+name: CD — Deploy to Cloud Run
+
+on:
+  push:
+    branches: [main]
+
+env:
+  GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  GCP_REGION: asia-south1
+  IMAGE_PREFIX: gcr.io/${{ secrets.GCP_PROJECT_ID }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for GCR
+        run: gcloud auth configure-docker
+
+      - name: Build and push contract-api
+        run: |
+          docker build -t $IMAGE_PREFIX/contract-api:$GITHUB_SHA ./services/contract_api
+          docker push $IMAGE_PREFIX/contract-api:$GITHUB_SHA
+
+      - name: Build and push agent-engine
+        run: |
+          docker build -t $IMAGE_PREFIX/agent-engine:$GITHUB_SHA ./services/agent_engine
+          docker push $IMAGE_PREFIX/agent-engine:$GITHUB_SHA
+
+      - name: Deploy contract-api to Cloud Run
+        run: |
+          gcloud run deploy contract-api \
+            --image $IMAGE_PREFIX/contract-api:$GITHUB_SHA \
+            --region $GCP_REGION \
+            --platform managed \
+            --allow-unauthenticated \
+            --set-env-vars GCP_PROJECT_ID=$GCP_PROJECT_ID \
+            --set-secrets GEMINI_API_KEY=gemini-api-key:latest
+
+      - name: Deploy agent-engine to Cloud Run
+        run: |
+          gcloud run deploy agent-engine \
+            --image $IMAGE_PREFIX/agent-engine:$GITHUB_SHA \
+            --region $GCP_REGION \
+            --platform managed \
+            --no-allow-unauthenticated \
+            --set-secrets GEMINI_API_KEY=gemini-api-key:latest

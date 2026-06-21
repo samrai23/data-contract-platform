@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+venv/
+.venv/
+env/
+
+# Environment
+.env
+.env.local
+*.env
+
+# GCP credentials - NEVER commit these
+gcp-credentials.json
+service-account*.json
+*-credentials.json
+
+# dbt
+dbt_project/target/
+dbt_project/logs/
+dbt_project/dbt_packages/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Docker
+.docker/
+
+# IDE
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Test coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Spark
+derby.log
+metastore_db/
+
+# Data files (use GCS instead)
+*.parquet
+*.csv
+*.json.gz
+data/raw/
+data/processed/
