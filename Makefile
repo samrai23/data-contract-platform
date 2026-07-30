@@ -16,7 +16,7 @@ help:
 	@echo "    make env            → Copy .env.example to .env (fill in your keys)"
 	@echo ""
 	@echo "  Docker"
-	@echo "    make up             → Start full local stack (Kafka + all services)"
+	@echo "    make up             → Start full local stack (Pub/Sub emulator + all services)"
 	@echo "    make down           → Stop all containers"
 	@echo "    make logs           → Tail all container logs"
 	@echo "    make logs-agent     → Tail agent-engine logs only"
@@ -30,7 +30,7 @@ help:
 	@echo "  Dev Tools"
 	@echo "    make lint           → Run ruff linter"
 	@echo "    make format         → Run black formatter"
-	@echo "    make simulate-drift → Send a drift event to Kafka (for testing)"
+	@echo "    make simulate-drift → Send a drift event to Pub/Sub (for testing)"
 	@echo "    make seed           → Seed sample vendor contracts to BigQuery"
 	@echo "    make clean          → Remove all containers, volumes, cache"
 	@echo ""
@@ -47,6 +47,8 @@ env:
 
 up:
 	docker compose up -d --build
+	@echo "  Creating Pub/Sub topics + subscriptions (needed after every fresh emulator start)..."
+	python scripts/setup_pubsub_emulator.py
 	@echo "✓ Stack running"
 	@echo "  FastAPI:        http://localhost:8000/docs"
 	@echo "  Pub/Sub emu:    http://localhost:8085"

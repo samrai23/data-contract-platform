@@ -11,7 +11,8 @@ This is the canonical, storage-facing representation of a contract — used by:
 
 It is intentionally decoupled from schema_comparator.DataContract (which is an
 internal dataclass used only inside the drift-detection algorithm).  Conversion
-between the two happens at the use site — see kafka_drift_job._to_comparator().
+between the two happens at the use site — see ApiContractRegistry.get_contract()
+in spark_jobs/streaming/pubsub_drift_job.py.
 
 Supported field types
 ---------------------

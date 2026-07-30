@@ -53,7 +53,7 @@ if not os.getenv("GOOGLE_API_KEY") and os.getenv("GEMINI_API_KEY"):
     os.environ["GOOGLE_API_KEY"] = os.environ["GEMINI_API_KEY"]
 
 _llm = ChatGoogleGenerativeAI(
-    model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
+    model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
     temperature=0,   # deterministic — we want consistent decisions, not creative ones
 )
 
@@ -187,12 +187,18 @@ Based on this information, what should we do?
 
 def execute_auto_heal(state: DriftAgentState) -> dict:
     """
-    Log the drift event and auto-approve it.
+    Log the drift event, approve it, then update the stored contract itself.
 
-    Auto-heal means: we log the event as AUTO_HEALED and immediately approve
-    it.  In a full implementation, this would also trigger a contract version
-    bump (1.0.0 → 1.1.0) and update the contract_json in BigQuery.
-    For Phase 3, logging + approval is sufficient to demonstrate the flow.
+    Auto-heal means three steps, always in this order:
+      1. Log the event as AUTO_HEALED (audit trail exists regardless of what follows)
+      2. Approve it via the contract-api
+      3. Apply the drift to the stored contract and bump its version (1.0.0 → 1.1.0)
+
+    Step 3 is what makes healing actually "heal" something — without it, the
+    contract stays stale and the next batch of vendor messages would report
+    the exact same field as drift again, forever. Steps 1-2 run first and are
+    logged/returned independently of step 3's outcome, so a contract-update
+    failure never hides the fact that the drift was detected and approved.
     """
     drift_event = state["drift_event"]
     vendor_id   = state["vendor_id"]
@@ -224,11 +230,37 @@ def execute_auto_heal(state: DriftAgentState) -> dict:
             approved_by="gemini-agent",
             notes=reasoning,
         )
-        action = f"AUTO_HEALED: event {event_id} approved by gemini-agent"
+        approval_ok = True
     except Exception as exc:
-        # Approval endpoint requires billing — log the intent even if it fails
+        # Approval endpoint requires billing (DML UPDATE) — log the intent even if it fails
         log.warning("agent.auto_heal.approval_failed", error=str(exc))
-        action = f"AUTO_HEAL logged (event {event_id}) — approval skipped: {exc}"
+        approval_ok = False
+
+    # Step 3: apply the drift to the stored contract and bump its version.
+    # This is separate from approval on purpose — a failure here must not make
+    # it look like the event wasn't logged or approved; it only means the
+    # contract itself wasn't updated and will need a manual fix or a retry.
+    try:
+        healed = tools.heal_contract(
+            vendor_id=vendor_id,
+            drift_type=drift_event.get("drift_type", "unknown"),
+            field_name=drift_event.get("field_name", "unknown"),
+            old_type=drift_event.get("old_type", "") or "",
+            new_type=drift_event.get("new_type", "") or "",
+        )
+        new_version = healed.get("version", "unknown")
+        action = (
+            f"AUTO_HEALED: event {event_id} "
+            f"{'approved' if approval_ok else 'approval FAILED'} by gemini-agent; "
+            f"contract bumped to v{new_version}"
+        )
+    except Exception as exc:
+        log.error("agent.auto_heal.contract_update_failed", error=str(exc))
+        action = (
+            f"AUTO_HEALED: event {event_id} "
+            f"{'approved' if approval_ok else 'approval FAILED'} by gemini-agent; "
+            f"contract version bump FAILED: {exc}"
+        )
 
     log.info("agent.auto_heal.complete", vendor_id=vendor_id, event_id=event_id)
     return {"event_id": event_id, "action_taken": action}

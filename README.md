@@ -1,70 +1,120 @@
 # Agentic Data Contract & Ingestion Platform
 
-> **Auto-detects vendor schema drift in real-time, classifies it, and either heals the pipeline autonomously or escalates to a human — with guardrails preventing any destructive operation.**
+> **Detects vendor schema drift from a live Pub/Sub feed, classifies it, and either auto-heals the stored contract or escalates to a human for approval — with a full audit trail either way.**
+
+This README was rewritten on 2026-07-30 to match what's actually in this repository, verified file by file. Where earlier drafts of this README described the original plan rather than what got built, this version says so explicitly instead of leaving it implied.
 
 ---
 
 ## The Problem This Solves
 
-A vendor sends 500K JSON records daily. Today: `user_id` is an `INTEGER`. Tomorrow, without warning: `user_id` is a `STRING`. Your PySpark job crashes. BigQuery table goes stale. Analyst escalates at 9 AM. You spend 2 hours debugging.
+A vendor sends a JSON feed daily. One day, without warning, a field's data type changes, a column disappears, or a column gets renamed. Every downstream pipeline reading that feed breaks — silently or loudly — and someone finds out hours later when a dashboard looks wrong.
 
-This platform detects that drift in **under 90 seconds**, classifies it, and either auto-heals or routes to human approval — all with guardrails that prevent any destructive operation.
+This platform watches vendor feeds in near-real-time via Pub/Sub, detects that kind of schema drift automatically, classifies how risky it is, and either fixes it without a human or routes it to a human for approval, logging every decision either way.
 
 ---
 
-## Architecture
+## Architecture (what actually runs)
 
 ```
-Vendor Feeds (JSON/CSV)
+Vendor Feeds (JSON)
         │
         ▼
  Pub/Sub Topic (vendor-feeds)
         │
         ▼
-Python Subscriber + PySpark ────► Schema Drift Detected?
-        │                               │
-        │ No drift                      │ Yes
-        ▼                               ▼
- BigQuery (raw tables)        Drift Event → Kafka (drift-events)
-                                         │
-                                         ▼
-                              LangGraph Agent Engine
-                              ┌─────────────────────┐
-                              │  Agent 1: Analyst   │ ← calls MCP Server
-                              │  Agent 2: Writer    │ ← generates contract
-                              │  Agent 3: Healer    │ ← applies fix or escalates
-                              └─────────────────────┘
-                                         │
-                              ┌──────────┴──────────┐
-                              │                     │
-                         Safe drift            Risky drift
-                              │                     │
+ drift-detector (plain Python, no PySpark)
+        │  ├─ HTTP GET → contract-api (fetch stored contract)
+        │  └─ schema_comparator.py: infer + compare + classify
+        ▼
+ Pub/Sub Topic (drift-events)   ← only fires if drift was detected
+        │
+        ▼
+ agent-engine — ONE LangGraph StateGraph, 4 nodes
+ ┌───────────────────────────────────────────────┐
+ │ fetch_context → decide_action (Gemini 2.5)     │
+ │        │                                       │
+ │   AUTO_HEAL ─────────────┐   ESCALATE/IGNORE ──┼─┐
+ └───────────────────────────┼─────────────────────┼─┘
                               ▼                     ▼
-                      Auto-heal pipeline    Human approval
-                      Update dbt schema     via FastAPI webhook
-                      Run GE validation
-                              │
+                  log + approve + PATCH        log as
+                  /contracts/{id}/heal        PENDING_APPROVAL
+                  (bumps contract version)          │
+                              │                      ▼
+                              │              Human via Swagger UI
+                              │              POST /approve/{event_id}
                               ▼
-                   BigQuery (healed data + audit trail)
-                   dbt mart layer → Looker Studio dashboard
+                         BigQuery (vendor_contracts, drift_events)
 ```
 
-### Tech Stack (all free tier for portfolio)
+Runs as **4 Docker containers** (contract-api, mcp-server, agent-engine, drift-detector) plus a local Pub/Sub emulator — verified by `docker-compose.yml`, which is the ground truth for what's wired together. There is no Kafka container anywhere in this stack.
+
+### The one correction worth stating up front
+
+The original plan for this project (an earlier draft of this README) described **three separate agents** — Analyst, Contract Writer, Healer. What's actually built is **one LangGraph `StateGraph` with 4 nodes** (`fetch_context`, `decide_action`, `execute_auto_heal`, `execute_escalate`). This was a deliberate simplification, not a shortfall — see `docs/architecture/system_design.md` for the full reasoning (short version: all three "agents" need to share the same drift event / contract / decision at every step, so a single shared-state graph does the job without an artificial message-passing layer between agent processes).
+
+---
+
+## What's Actually Built (Done)
+
+- **Pub/Sub ingestion** — real, working. `docker-compose.yml` runs a local Pub/Sub emulator; `pubsub_drift_job.py` and `event_publisher.py` use `google-cloud-pubsub` directly. No Kafka.
+- **Schema drift detection** — pure Python, zero external dependencies (`schema_comparator.py`, `schema_infer.py`), unit-tested (558 lines of tests). Detects 4 drift types: `type_change`, `new_column`, `dropped_column`, `column_rename`, each classified LOW/MEDIUM/HIGH with a widening-vs-narrowing type table deciding auto-heal safety.
+- **Rename-detection heuristic** — only declares a rename when exactly one dropped field and one new field share a type; ambiguous many-to-many matches are deliberately left as separate drops/adds rather than guessed.
+- **LangGraph agent** — 1 StateGraph, 4 nodes, Gemini 2.5 Flash (`temperature=0`) makes the AUTO_HEAL / ESCALATE / IGNORE call. IGNORE is routed to the same handler as ESCALATE (never silently drops an event). A malformed/unparseable LLM response defaults to ESCALATE, never AUTO_HEAL.
+- **MCP server** — 1 server, 5 tools (`get_contract`, `list_vendors`, `log_drift_event`, `get_drift_history`, `submit_approval`), FastMCP over SSE transport.
+- **Contract API** — FastAPI, 7 endpoints (see API Reference below), BigQuery-backed, parameterized queries throughout (no SQL injection surface).
+- **Contract-writer / auto-heal now actually updates the contract** *(added 2026-07-30)* — `PATCH /api/v1/contracts/{vendor_id}/heal` applies the healed field change to the stored contract and calls `bump_minor()`/`bump_major()` on the domain model, then persists it via a parameterized `UPDATE`. Previously `execute_auto_heal()` only logged the event and approved it without ever touching `contract_json` — meaning the same field would drift again on the next batch. That gap is closed now.
+- **Unit test coverage** — real and substantial: `test_schema_comparator.py` (558 lines), `test_contract_validator.py` (209 lines), `test_api_endpoints.py` integration (347 lines).
+- **Simulation harness** — `scripts/simulate_drift.py` sends synthetic drift for 2 vendors × 4 drift types. Each drift type is now isolated to exactly the intended field(s) via explicit `rename`/`override`/`drop`/`add` transforms *(fixed 2026-07-30 — a prior version's field-omission bug meant every run silently polluted results with extra bogus events)*.
+
+---
+
+## Explicitly NOT Built (and why that's fine to say out loud)
+
+| Component | Status | Reality |
+|---|---|---|
+| **Kafka** | Not used | `infra/docker/kafka.yml` and `zookeeper.yml` exist but are never referenced by `docker-compose.yml` — leftover from the original design, before the pivot to Pub/Sub. Pub/Sub is fully managed, needs no ZooKeeper/broker ops, and has a free local emulator with an API identical to production. |
+| **PySpark / Spark Structured Streaming** | Not implemented | `schema_infer.py`'s own docstring says "deliberately dependency-free — no PySpark." The whole detection path is plain Python using `google-cloud-pubsub`'s synchronous pull API. `spark_jobs/streaming/config.py` has a fully-written `SparkSessionConfig` dataclass for a *future* Dataproc migration, but nothing ever instantiates it. |
+| **dbt** | Not needed, not implemented | No `dbt_project/` directory exists. `dbt-bigquery` is listed in `pyproject.toml` but unused. Decided we don't need it for this project's scope — contract validation already happens in Pydantic, not a transformation layer. |
+| **Great Expectations** | Not implemented | Listed in `pyproject.toml`, never wired in. No GE suite/checkpoint files exist. |
+| **NeMo Guardrails** | Not implemented | `guardrails/nemo_config/{config.yml,actions.py}` and `guardrails/policies/*.co` are all 0 bytes. Destructive-op prevention is **structural instead**: every BigQuery write in this system is either `load_table_from_json()` (INSERT-only, can't DROP/DELETE/TRUNCATE) or one fixed, hand-written, parameterized `UPDATE` query — there is no code path anywhere that builds arbitrary SQL from agent or user input. |
+| **Batch jobs** (`audit_aggregator.py`, `contract_sync.py`) | Scaffolded, empty | Both 0 bytes. `pipeline_audit` BigQuery table exists (created by `setup_bigquery.py`) but nothing writes to it yet. |
+| **E2E / some integration tests** | Scaffolded, empty | `tests/unit/test_agent_graph.py`, `tests/integration/test_drift_pipeline.py`, `tests/e2e/test_full_heal_loop.py` are all 0 bytes. |
+
+---
+
+## Results
+
+No `%` auto-healed or mean-time-to-heal numbers are published here yet. Earlier notes for this project stated "84% auto-healed... under 90 seconds" — those were placeholder targets from the original planning doc, never actually measured, and have been removed rather than repeated. This section will be filled in with real `make simulate-drift` results once they've been properly measured.
+
+---
+
+## Future Scope (not yet built — priority order)
+
+1. **Wrap the Gemini call in `decide_action()` in a try/except** — right now a network failure or API error during the LLM call itself (not just a malformed response) raises an unhandled exception for that one event. The outer subscriber loop catches it and doesn't crash, but that event's decision is lost rather than defaulting to ESCALATE.
+2. **Write the empty test files** — `test_agent_graph.py`, `test_drift_pipeline.py`, `test_full_heal_loop.py` — especially the E2E test, since it's the only thing that would catch a regression across the full simulate → detect → decide → heal loop.
+3. **Measure and record real performance numbers** — run `make simulate-drift` across all 4 drift types × both vendors repeatedly and compute a real AUTO_HEAL/ESCALATE percentage from `drift_events`, instead of leaving the Results section blank.
+4. **Implement the batch jobs** (`audit_aggregator.py`, `contract_sync.py`) — `pipeline_audit` table exists with no writer.
+5. **NeMo Guardrails as defense-in-depth** — not because the system is currently unsafe (see the "Explicitly NOT Built" table above for why), but as an additional inspection layer if the agent ever generates more open-ended remediation actions than AUTO_HEAL/ESCALATE.
+6. **Multi-consumer-aware severity** — right now `is_safe_to_auto_heal` is one global verdict; a genuinely bigger feature would let different downstream consumers register which fields they actually read, so a dropped column nobody reads could be LOW severity instead of always HIGH.
+7. **Planned-migration awareness** — let a vendor/engineer pre-register an expected schema change (e.g. "user_id becomes STRING on Tuesday") so the agent can distinguish a communicated migration from a genuine surprise, instead of routing both through the identical ESCALATE path.
+8. **Horizontal scaling for agent-engine** — currently processes one Pub/Sub message at a time, synchronously, by design (each LLM call is 1-3s, no thread-safety complexity needed at current volume). If drift-event frequency ever exceeds that, the fix is more agent-engine replicas on the same subscription, not a threading rewrite.
+
+---
+
+## Tech Stack (what's actually used)
 
 | Layer | Technology | Why |
 |---|---|---|
-| Streaming ingest | GCP Pub/Sub (free tier — 10 GB/month) | Fully managed, no cluster ops, native GCP |
-| Batch processing | PySpark on Dataproc Serverless | Handles scale, your core skill |
-| Data warehouse | Google BigQuery (1TB/month free) | Delhi NCR market standard |
-| Agent orchestration | LangGraph 1.0 | Production-grade, 400+ companies |
-| Tool protocol | MCP (Model Context Protocol) | Secure, standardised agent tools |
-| LLM | Gemini 2.0 Flash (1,500 req/day free) | No billing needed |
-| Guardrails | NeMo Guardrails (Apache 2.0, free) | Prevents destructive operations |
-| Transformation | dbt + BigQuery | Contract-as-code enforcement |
-| Data quality | Great Expectations (open source) | Post-heal validation |
-| API layer | FastAPI + Pydantic v2 | Type-safe, auto-documented |
-| Containerisation | Docker + Docker Compose | Local dev parity |
-| CI/CD | GitHub Actions → Cloud Run | Free tier deploy |
+| Message broker | GCP Pub/Sub (local emulator for dev) | Fully managed, no ZooKeeper/broker ops, free tier, local emulator with an API identical to production |
+| Drift detection | Pure Python (no PySpark) | Zero infra dependency for unit tests; transport-layer decoupling means the comparison logic doesn't care whether messages came from Pub/Sub or a file |
+| Data warehouse | Google BigQuery | SQL-queryable audit trail; free tier allows read/DDL/batch-load; DML (contract heal + human approval) requires a linked billing account |
+| Agent orchestration | LangGraph (`StateGraph`, 4 nodes) | Shared `TypedDict` state across nodes without a message-passing layer; conditional edges for AUTO_HEAL vs ESCALATE routing |
+| LLM | Gemini 2.5 Flash via `langchain-google-genai` | Free tier (1,500 req/day), `temperature=0` for deterministic decisions |
+| Tool protocol | MCP (FastMCP, SSE transport) | Typed tool schemas for the LLM; SSE keeps one connection open across a rapid sequence of tool calls |
+| API layer | FastAPI + Pydantic v2 | Auto-generated Swagger docs at `/docs`, async-native, `Depends()` injection for a singleton BigQuery client |
+| Containerization | Docker + Docker Compose | One container per service, mirrors a 1:1 Cloud Run mapping for production |
+| CI/CD | GitHub Actions (`ci.yml` + `cd.yml`) | Lint + test on PR; deploy to Cloud Run on merge to main |
 
 ---
 
@@ -72,347 +122,152 @@ Python Subscriber + PySpark ────► Schema Drift Detected?
 
 ```
 data-contract-platform/
-│
 ├── services/
-│   ├── contract_api/          # FastAPI — human-facing API
-│   │   ├── main.py            # App entry point, middleware
-│   │   ├── routers.py         # All route definitions
-│   │   ├── models.py          # Pydantic request/response models
-│   │   ├── dependencies.py    # BigQuery client, auth injection
-│   │   ├── Dockerfile
-│   │   └── requirements.txt
-│   │
-│   ├── drift_detector/        # PySpark Structured Streaming job
-│   │   ├── detector.py        # Main Spark job entry point
-│   │   ├── schema_comparator.py  # Core drift detection logic
-│   │   ├── event_publisher.py    # Publishes drift events to Kafka
-│   │   ├── Dockerfile
-│   │   └── requirements.txt
-│   │
-│   ├── agent_engine/          # LangGraph multi-agent system
-│   │   ├── graph.py           # LangGraph state graph definition
-│   │   ├── agents.py          # Agent implementations (Analyst, Writer, Healer)
-│   │   ├── state.py           # Shared state schema (TypedDict)
-│   │   ├── tools.py           # Tool wrappers for MCP calls
-│   │   ├── Dockerfile
-│   │   └── requirements.txt
-│   │
-│   └── mcp_server/            # MCP tool server (secure BQ + contract access)
-│       ├── server.py          # MCP server entry point
-│       ├── bq_tools.py        # BigQuery tools (get_schema, run_query)
-│       ├── contract_tools.py  # Contract registry tools
-│       ├── Dockerfile
-│       └── requirements.txt
+│   ├── contract_api/       # FastAPI — 7 endpoints, BigQuery-backed
+│   ├── drift_detector/     # Pub/Sub subscriber + schema_comparator.py (the core algorithm)
+│   ├── agent_engine/       # LangGraph — 4 nodes, Gemini 2.5 Flash
+│   └── mcp_server/         # FastMCP — 5 tools, SSE transport
 │
 ├── spark_jobs/
-│   ├── streaming/
-│   │   ├── pubsub_drift_job.py # Main Pub/Sub subscriber + drift processing loop
-│   │   ├── schema_infer.py     # Schema inference from JSON message batches
-│   │   └── config.py           # Spark + Pub/Sub + BigQuery config
-│   └── batch/
-│       ├── audit_aggregator.py # Daily audit rollup to BigQuery
-│       └── contract_sync.py    # Syncs contracts from registry to BQ
+│   ├── streaming/          # Real code (misleadingly named) — pubsub_drift_job.py, schema_infer.py, config.py
+│   └── batch/               # Empty scaffolding — audit_aggregator.py, contract_sync.py (0 bytes)
 │
-├── dbt_project/               # dbt transformation layer
-│   ├── dbt_project.yml
-│   ├── profiles.yml.example   # Copy to ~/.dbt/profiles.yml
-│   └── models/
-│       ├── staging/           # Raw vendor data + drift events
-│       ├── intermediate/      # Contract version history
-│       └── mart/              # vendor_health, drift_summary dashboards
-│
-├── guardrails/
-│   ├── nemo_config/
-│   │   ├── config.yml         # NeMo Guardrails main config
-│   │   └── actions.py         # Custom Python actions (dry-run BQ)
-│   └── policies/
-│       ├── no_destructive_ops.co   # Colang: block DROP/DELETE/TRUNCATE
-│       └── safe_schema_evolution.co # Colang: safe vs risky cast rules
+├── guardrails/              # NeMo Guardrails scaffolding — ALL FILES EMPTY (0 bytes), not implemented
 │
 ├── data_contracts/
-│   ├── schemas/               # Versioned contract JSON schemas
-│   ├── registry/              # Active contract registry (git-versioned)
-│   └── templates/
-│       ├── base_contract.json      # Base contract template
-│       └── pydantic_contract.py   # Pydantic model for contracts
+│   ├── templates/           # pydantic_contract.py — the domain model (VendorContract, bump_minor/bump_major)
+│   ├── registry/            # Phase 1 static contract files, superseded by the live contract-api
+│   └── schemas/
 │
 ├── infra/
-│   ├── docker/                # Kafka + Zookeeper compose fragments
-│   ├── cloud_run/             # Cloud Run service definitions
+│   ├── docker/               # kafka.yml, zookeeper.yml — NOT referenced by docker-compose.yml, unused leftovers
+│   ├── cloud_run/
 │   └── github_actions/
-│       ├── ci.yml             # Lint + test on every PR
-│       └── cd.yml             # Build + deploy to Cloud Run on main
 │
 ├── tests/
-│   ├── unit/                  # Fast, no external deps
-│   ├── integration/           # Requires local Kafka + mock BQ
-│   └── e2e/                   # Full drift → heal loop
+│   ├── unit/                 # test_schema_comparator.py (558 lines), test_contract_validator.py (209 lines) — real
+│   ├── integration/          # test_api_endpoints.py (347 lines, real); test_drift_pipeline.py (0 bytes, empty)
+│   └── e2e/                  # test_full_heal_loop.py — 0 bytes, empty
 │
 ├── docs/
-│   ├── architecture/          # System design docs
-│   ├── prompts/               # All LLM prompts with version history
-│   └── runbooks/              # Local setup, drift simulation, deploy
+│   ├── architecture/         # system_design.md — every architecture decision + its rejected alternative
+│   ├── prompts/
+│   └── runbooks/
 │
 ├── scripts/
-│   ├── simulate_drift.py      # 🔑 Send drift events to local Kafka
-│   ├── seed_contracts.py      # Seed sample vendor contracts to BQ
-│   ├── generate_vendor_feed.py # Generate test data
-│   └── setup_bigquery.sh      # One-time BQ table creation
+│   ├── simulate_drift.py     # Main testing/demo tool — 2 vendors × 4 drift types
+│   ├── seed_contracts.py     # Seeds via the live API (not direct BQ writes) — doubles as an integration test
+│   ├── setup_bigquery.py     # One-time BQ dataset/table creation (Python version — bash version also exists)
+│   ├── setup_pubsub_emulator.py
+│   └── list_gemini_models.py # Diagnostic: checks which Gemini models your key can ACTUALLY call
 │
-├── notebooks/                 # Jupyter notebooks for exploration
-├── docker-compose.yml         # Full local stack
-├── Makefile                   # All dev commands
-├── pyproject.toml             # Single source of all Python deps
-├── .env.example               # All required env vars documented
-└── .gitignore                 # Includes GCP credentials exclusion
+├── docker-compose.yml         # Ground truth for what actually runs — 4 services + Pub/Sub emulator, no Kafka
+├── Makefile
+├── pyproject.toml             # Includes some unused deps (dbt-bigquery, great-expectations, pyspark, nemoguardrails)
+└── .env.example
 ```
 
 ---
 
-## Build Phases (follow this order)
-
-### Phase 1 — Local Foundation (Week 1)
-**Goal:** Get Kafka running locally, write and test the schema comparator.
-
-- [ ] Set up local environment (see Local Setup below)
-- [ ] Start Kafka + Kafka UI via `make up`
-- [ ] Write `services/drift_detector/schema_comparator.py`
-- [ ] Write unit tests for comparator — test all 4 drift types
-- [ ] Run `make simulate-drift` and verify events appear in Kafka UI
-- [ ] Write `data_contracts/templates/pydantic_contract.py`
-
-**Commit message convention:** `feat(detector): add schema comparator with type drift detection`
-
-### Phase 2 — BigQuery + FastAPI (Week 1–2)
-**Goal:** Contracts stored in BQ, API to register vendors.
-
-- [ ] Run `scripts/setup_bigquery.sh` against your GCP project
-- [ ] Write `services/contract_api/models.py` (Pydantic v2 contracts)
-- [ ] Write `services/contract_api/routers.py` (POST /vendors, GET /contracts)
-- [ ] Test API at `http://localhost:8000/docs`
-- [ ] Write `scripts/seed_contracts.py` and seed 3 sample vendors
-- [ ] Integration test: register vendor → store in BQ → retrieve via API
-
-### Phase 3 — MCP Server (Week 2)
-**Goal:** Agents can query BQ and contracts without raw credential access.
-
-- [ ] Write `services/mcp_server/bq_tools.py` (get_schema, get_table_stats)
-- [ ] Write `services/mcp_server/contract_tools.py` (get_contract, get_drift_history)
-- [ ] Test MCP server locally with a simple Python client
-- [ ] Document each tool's input/output schema in `docs/`
-
-### Phase 4 — LangGraph Agents (Week 2–3)
-**Goal:** All 3 agents working in a graph, consuming real drift events.
-
-- [ ] Write `services/agent_engine/state.py` — shared TypedDict state
-- [ ] Write Agent 1 (Analyst) — reads drift event, classifies severity
-- [ ] Write Agent 2 (Contract Writer) — generates new contract + dbt YAML
-- [ ] Write Agent 3 (Healer) — applies fix or routes to human approval
-- [ ] Wire graph in `services/agent_engine/graph.py` with conditional edges
-- [ ] Add NeMo Guardrails to Agent 2 output
-- [ ] Test full loop: simulate drift → agent → see heal or escalation
-
-### Phase 5 — dbt + Great Expectations (Week 3)
-**Goal:** Data quality enforced, marts available for dashboard.
-
-- [ ] Write dbt staging models for vendor_feeds and drift_events
-- [ ] Write dbt mart models for vendor_health dashboard
-- [ ] Add GE validation suite on healed data before BQ write
-- [ ] Run `dbt run` and `dbt test` — all green
-
-### Phase 6 — CI/CD + Polish (Week 3–4)
-**Goal:** Push to GitHub, CI passes, deploy to Cloud Run.
-
-- [ ] Copy `infra/github_actions/ci.yml` → `.github/workflows/ci.yml`
-- [ ] Push to GitHub — CI should pass on first try (if tests are green locally)
-- [ ] Deploy contract-api to Cloud Run via CD workflow
-- [ ] Write your `docs/prompts/` files — document each prompt iteration
-- [ ] Write the README benchmark section with your actual test results
-
----
-
-## Local Setup — Step by Step
+## Local Setup
 
 ### Prerequisites
-Install these before anything else:
 
 ```bash
-# 1. Python 3.11+
-python --version  # should be 3.11.x or 3.12.x
-
-# 2. Docker Desktop
+python --version   # 3.11.x or 3.12.x
 docker --version
 docker compose version
-
-# 3. Git
 git --version
-
-# 4. VS Code extensions to install:
-#    - Python (Microsoft)
-#    - Docker (Microsoft)
-#    - dbt Power User
-#    - REST Client (for testing API without Postman)
 ```
 
 ### Step 1 — Clone and configure
 
 ```bash
-# Clone your repo (after creating it on GitHub)
-git clone https://github.com/YOUR_USERNAME/data-contract-platform.git
+git clone https://github.com/samrai23/data-contract-platform.git
 cd data-contract-platform
-
-# Create your .env file
-make env
-# Now open .env and fill in your API keys (see Free Tier Setup below)
+make env   # copies .env.example to .env — fill in your keys
 ```
 
-### Step 2 — Free Tier API Keys
+### Step 2 — Free-tier API keys
 
-Get these — all free, no credit card needed for dev:
+**Google AI Studio (Gemini):**
+1. Go to https://aistudio.google.com → "Get API Key" → Create API Key
+2. Add to `.env`: `GEMINI_API_KEY=your-key`, `GEMINI_MODEL=gemini-2.5-flash`
+3. If you get a `404` or `PERMISSION_DENIED` on any model, run `python scripts/list_gemini_models.py` — it hits the live `v1beta/models` endpoint directly, which is the actual source of truth (the GCP Quota Console lags behind and can show stale info in both directions).
 
-**Google AI Studio (Gemini 2.0 Flash):**
-1. Go to https://aistudio.google.com
-2. Click "Get API Key" → Create API Key
-3. Add to `.env`: `GEMINI_API_KEY=your-key`
+**GCP / BigQuery:**
+1. Create a GCP project, enable the BigQuery and Pub/Sub APIs
+2. IAM → Service Accounts → Create → download JSON key → save as `gcp-credentials.json` in the project root (already gitignored)
+3. Run `python scripts/setup_bigquery.py`
+4. **If you need `POST /approve/{event_id}` or `PATCH /contracts/{vendor_id}/heal` to actually persist**, link a billing account to this project (Console → Billing). Batch-load writes (vendor registration, drift logging) work without it; these two DML-based endpoints don't.
 
-**GCP / BigQuery (free $300 trial):**
-1. Go to https://console.cloud.google.com
-2. Create new project, enable billing (trial — no charge)
-3. Enable BigQuery API, Pub/Sub API
-4. IAM → Service Accounts → Create → Download JSON key
-5. Save as `gcp-credentials.json` in project root (already in .gitignore)
-6. Run: `bash scripts/setup_bigquery.sh`
-
-**Confluent Kafka (free tier — 1 cluster, 5GB/month):**
-1. Go to https://confluent.cloud → Sign up free
-2. Create cluster → Basic → GCP → asia-south1
-3. Create API Key → copy to `.env`
-4. Create topics: `vendor-feeds`, `drift-events`, `heal-actions`
-5. For local dev, use the local Kafka in docker-compose instead
+No Kafka account or setup needed — Pub/Sub is the only message broker this project uses.
 
 ### Step 3 — Start the local stack
 
 ```bash
-# Install Python dependencies
-make setup
-
-# Start Kafka + all services
-make up
-
-# Verify everything is running
-docker ps
-# You should see: zookeeper, kafka, kafka-ui, contract-api, mcp-server, agent-engine, drift-detector
-
-# Open Kafka UI
-open http://localhost:8080
-
-# Open FastAPI docs
-open http://localhost:8000/docs
+make up   # docker compose up -d --build, then creates Pub/Sub topics + subscriptions automatically
 ```
 
-### Step 4 — Run your first drift simulation
+The emulator's topics/subscriptions don't persist across a fresh container start, so `make up` always (re)creates them — this is idempotent, safe to run repeatedly.
+
+```
+FastAPI docs:   http://localhost:8000/docs
+Pub/Sub emu:    http://localhost:8085
+MCP Server:     http://localhost:8001
+```
+
+### Step 4 — Run a drift simulation
 
 ```bash
-# Seed a sample vendor contract
-make seed
-
-# Start sending vendor feed messages (with drift after message 10)
-make simulate-drift
-
-# Watch the agent-engine logs react to the drift
-make logs-agent
+make seed              # seed sample vendor contracts
+make simulate-drift    # sends drift after message N — see scripts/simulate_drift.py --help for options
+make logs-agent        # watch the agent react
 ```
 
-You should see:
+Realistic example of what you'll actually see in `agent-engine` logs for a clean widening type change:
 ```
-[drift-detector] ⚠️  Schema drift detected for vendor: cars24
-[drift-detector] Drift type: type_change on field: user_id (INT → STRING)
-[agent-engine]   Agent 1 (Analyst): severity=MEDIUM, classification=safe_cast
-[agent-engine]   Agent 2 (Writer): generating updated contract v2...
-[agent-engine]   NeMo Guardrails: output validated — no destructive ops
-[agent-engine]   Agent 3 (Healer): applying schema fix to BigQuery...
-[contract-api]   Contract updated: cars24 v1 → v2
+agent.decide_action.decided  decision=AUTO_HEAL  reasoning="The drift is a safe widening type
+  change from INT to STRING for 'user_id', which has a LOW severity and is marked as safe to
+  auto-heal. There is no history of repeated drifts on this specific field, meeting all criteria
+  for auto-healing."
 ```
-
-### Connecting VS Code to GitHub
-
-```bash
-# 1. In VS Code, install the "GitHub Pull Requests" extension
-
-# 2. Sign in to GitHub via VS Code
-#    Ctrl+Shift+P → "GitHub: Sign In"
-
-# 3. Create repo on GitHub first (github.com → New Repository)
-#    Name: data-contract-platform
-#    Private repo (keep it private until it's ready to show)
-
-# 4. Link your local folder to GitHub
-git init
-git remote add origin https://github.com/YOUR_USERNAME/data-contract-platform.git
-git branch -M main
-
-# 5. First commit
-git add .
-git commit -m "chore: initial project structure"
-git push -u origin main
-
-# 6. From now on, VS Code Source Control panel handles commits
-#    Or use the terminal — your call
+And for a dropped column:
 ```
-
-### GitHub Actions Setup (for CI to work)
-
-After pushing to GitHub:
-1. Go to your repo → Settings → Secrets and variables → Actions
-2. Add these secrets:
-   - `GCP_PROJECT_ID` — your GCP project ID
-   - `GEMINI_API_KEY` — your Google AI Studio key
-   - `WIF_PROVIDER` and `WIF_SERVICE_ACCOUNT` — for Cloud Run deploy (Phase 6 only)
+agent.decide_action.decided  decision=ESCALATE  reasoning="The drift event is a 'dropped_column'
+  for 'fuel_type', which has a HIGH severity and is explicitly marked as not safe to auto-heal.
+  This critical breaking change requires immediate human review."
+```
 
 ---
 
 ## API Reference
 
 ```
-POST /api/v1/vendors              Register a new vendor + their contract
-GET  /api/v1/vendors              List all registered vendors
-GET  /api/v1/contracts/{vendor}   Get active contract for a vendor
-GET  /api/v1/drift-log            Audit trail of all drift events
-POST /api/v1/approve/{event_id}   Human approval for risky schema changes
-GET  /api/v1/health               Health check
+POST   /api/v1/vendors                     Register a new vendor + their contract (batch load, free tier)
+GET    /api/v1/vendors                     List all registered vendors
+GET    /api/v1/contracts/{vendor_id}       Get the active contract for a vendor
+PATCH  /api/v1/contracts/{vendor_id}/heal  Apply an auto-healed drift + bump version (DML — needs billing)
+GET    /api/v1/drift-log                   Audit trail of all detected drift events
+POST   /api/v1/approve/{event_id}          Human approval/rejection of a risky drift (DML — needs billing)
+GET    /api/v1/health                      Liveness + BigQuery connectivity check
 ```
 
 Full interactive docs at `http://localhost:8000/docs` when running locally.
 
 ---
 
-## Guardrails Policy Summary
+## Destructive-Operation Safety (the real mechanism, not NeMo Guardrails)
 
-The NeMo Guardrails Colang policies enforce:
+The system never issues a raw `DROP`/`DELETE`/`TRUNCATE` in the first place, so there's nothing to block at runtime:
 
-| Operation | Allowed | Reason |
+| Operation | Mechanism | Requires billing? |
 |---|---|---|
-| INT → BIGINT | ✅ Auto-heal | Backward compatible widening |
-| INT → STRING | ✅ Auto-heal | Safe cast, no data loss |
-| STRING → INT | ⚠️ Human approval | Potential data loss |
-| Add new column | ✅ Auto-heal | Additive, non-breaking |
-| Remove column | ⚠️ Human approval | Breaking change |
-| NULLABLE → REQUIRED | ⚠️ Human approval | Would fail existing records |
-| DROP TABLE | ❌ Hard block | Forbidden by Colang rail |
-| DELETE / TRUNCATE | ❌ Hard block | Forbidden by Colang rail |
+| Register vendor / log drift event | `load_table_from_json()` — INSERT-only batch load | No |
+| Auto-heal contract update | One fixed, parameterized `UPDATE` on `vendor_contracts` | Yes |
+| Human approval/rejection | One fixed, parameterized `UPDATE` on `drift_events` | Yes |
 
----
-
-## Results (fill in after building)
-
-| Metric | Result |
-|---|---|
-| Drift events tested | ___ |
-| Auto-healed (no human needed) | ___% |
-| Mean time to detect | ___ seconds |
-| Mean time to heal | ___ seconds |
-| False positive rate | ___% |
-| GE test pass rate post-heal | ___% |
+There is no code path anywhere that builds a SQL string from agent output or user input and executes it. Safety comes from constraining *what operations are structurally possible*, not from a runtime guardrails layer inspecting output after the fact.
 
 ---
 

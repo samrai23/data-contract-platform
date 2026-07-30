@@ -82,6 +82,35 @@ def get_drift_history(vendor_id: str, limit: int = 10) -> list[dict]:
     return resp.json()
 
 
+def heal_contract(
+    vendor_id: str,
+    drift_type: str,
+    field_name: str,
+    old_type: str = "",
+    new_type: str = "",
+) -> dict:
+    """
+    Apply an auto-healed drift to the stored contract via the contract-api's
+    heal endpoint — bumps the semantic version and updates contract_json in
+    BigQuery. Called by execute_auto_heal() AFTER logging + approval, so a
+    contract-update failure never blocks the audit trail from being written.
+    """
+    log.info("tools.heal_contract", vendor_id=vendor_id, drift_type=drift_type, field_name=field_name)
+    resp = _http.patch(
+        f"{_API_BASE}/contracts/{vendor_id}/heal",
+        json={
+            "drift_type": drift_type,
+            "field_name": field_name,
+            "old_type": old_type or None,
+            "new_type": new_type or None,
+        },
+    )
+    if resp.status_code == 404:
+        raise ValueError(f"Cannot heal contract for vendor '{vendor_id}': {resp.json().get('detail', 'not found')}")
+    resp.raise_for_status()
+    return resp.json()
+
+
 def submit_approval(event_id: str, approved: bool, approved_by: str, notes: str) -> dict:
     """Submit an approval/rejection for a drift event via the contract-api."""
     log.info("tools.submit_approval", event_id=event_id, approved=approved)

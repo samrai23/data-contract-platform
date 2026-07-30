@@ -33,7 +33,7 @@ import os
 
 import structlog
 
-# Add /app/spark_jobs to path so imports in kafka_drift_job.py resolve.
+# Add /app/spark_jobs to path so imports in pubsub_drift_job.py resolve.
 # In the container /app is the working directory and spark_jobs/ is mounted
 # there.  When running locally this resolves relative to the project root.
 _PROJECT_ROOT = os.path.abspath(
@@ -43,7 +43,7 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 # spark_jobs/streaming/ is added so schema_comparator, schema_infer, config
-# can be imported by kafka_drift_job without relative import gymnastics.
+# can be imported by pubsub_drift_job without relative import gymnastics.
 _STREAMING_DIR = os.path.join(_PROJECT_ROOT, "spark_jobs", "streaming")
 if _STREAMING_DIR not in sys.path:
     sys.path.insert(0, _STREAMING_DIR)

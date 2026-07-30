@@ -35,6 +35,28 @@ from google.cloud import pubsub_v1
 
 DRIFT_TYPES = ["rename_column", "type_change", "add_column", "drop_column"]
 
+
+# ---------------------------------------------------------------------------
+# BUG FIX (2026-07-30): the previous version of this file defined drift
+# variants as flat dicts using `None` to mean "keep this field as normal".
+# generate_record() actually treated `None` as "omit this key from the
+# record" — so e.g. a "type_change" run didn't test ONE isolated type
+# change, it also silently dropped every field not explicitly re-listed,
+# firing 5 bogus dropped_column HIGH-severity escalations alongside the
+# 1 intended type_change event on every single drifted message. Confirmed
+# live against the real stack: a "type_change" run produced 1 AUTO_HEAL +
+# 6 ESCALATE decisions instead of 1 AUTO_HEAL.
+#
+# Fixed by making each drift variant an explicit TRANSFORM applied on top
+# of a freshly generated normal record, instead of a parallel field list:
+#   rename   {old: new}     — rename a key, value unchanged
+#   override {name: fn}     — replace a field's value/type (type_change)
+#   drop     [name, ...]    — remove fields entirely (drop_column)
+#   add      {name: fn}     — add a new field (add_column)
+# This guarantees a "type_change" run touches ONLY the overridden field(s)
+# and every other field stays exactly as in the normal schema.
+# ---------------------------------------------------------------------------
+
 VENDOR_SCHEMAS = {
     "cars24": {
         "normal": {
@@ -45,11 +67,18 @@ VENDOR_SCHEMAS = {
             "city":         lambda: random.choice(["Gurgaon", "Delhi", "Noida"]),
             "fuel_type":    lambda: random.choice(["Petrol", "Diesel", "CNG"]),
         },
-        # Drift variants — only the changed/remaining fields are defined
-        "rename_column": {"vehicleId": None, "userId": None, "price": None, "listing_date": None, "city": None, "fuel_type": None},
-        "type_change":   {"vehicle_id": None, "user_id": lambda: str(random.randint(1000, 9999)), "price": None},  # user_id INT → STRING
-        "drop_column":   {"vehicle_id": None, "price": None, "listing_date": None},  # city + fuel_type dropped
-        "add_column":    {"vehicle_id": None, "user_id": None, "price": None, "listing_date": None, "city": None, "fuel_type": None, "km_driven": lambda: random.randint(5000, 120000)},
+        "drift": {
+            # Cosmetic rename — same example agents.py's own system prompt
+            # docstring uses for "clearly cosmetic and safe".
+            "rename_column": {"rename": {"city": "city_name"}},
+            # INT → STRING is a safe widening change (schema_comparator's
+            # _WIDENING_CHANGES) — expected decision: AUTO_HEAL.
+            "type_change":   {"override": {"user_id": lambda: str(random.randint(1000, 9999))}},
+            # HIGH severity, never safe to auto-heal — expected: ESCALATE.
+            "drop_column":   {"drop": ["fuel_type"]},
+            # Purely additive — expected: AUTO_HEAL.
+            "add_column":    {"add": {"km_driven": lambda: random.randint(5000, 120000)}},
+        },
     },
     "paytm": {
         "normal": {
@@ -59,17 +88,42 @@ VENDOR_SCHEMAS = {
             "status":      lambda: random.choice(["SUCCESS", "FAILED", "PENDING"]),
             "created_at":  lambda: datetime.now(timezone.utc).isoformat(),
         },
-        "rename_column": {"transaction_id": None, "amount": None, "merchant_id": None, "status": None, "created_at": None},
-        "type_change":   {"txn_id": None, "amount": lambda: str(round(random.uniform(10, 50000), 2)), "merchant_id": None, "status": None, "created_at": None},
-        "drop_column":   {"txn_id": None, "amount": None, "status": None},
-        "add_column":    {"txn_id": None, "amount": None, "merchant_id": None, "status": None, "created_at": None, "upi_ref": lambda: f"UPI{random.randint(100000, 999999)}"},
+        "drift": {
+            "rename_column": {"rename": {"merchant_id": "merchant_ref"}},
+            # DOUBLE → STRING is NOT in the widening table — falls to the
+            # conservative MEDIUM/not-safe default. Expected: ESCALATE.
+            # (Deliberately different outcome from cars24's type_change —
+            # gives the simulation a mix of AUTO_HEAL and ESCALATE type changes.)
+            "type_change":   {"override": {"amount": lambda: str(round(random.uniform(10, 50000), 2))}},
+            "drop_column":   {"drop": ["created_at"]},
+            "add_column":    {"add": {"upi_ref": lambda: f"UPI{random.randint(100000, 999999)}"}},
+        },
     },
 }
 
 
-def generate_record(schema_def: dict) -> dict:
-    """Evaluate any callable values (lambdas) to produce a single record."""
-    return {k: (v() if callable(v) else v) for k, v in schema_def.items() if v is not None}
+def generate_record(normal_schema: dict, drift_spec: dict | None) -> dict:
+    """
+    Build one record: start from every field in normal_schema (all generators
+    evaluated), then apply at most one drift transform on top of it.
+
+    A drift_spec of None returns a clean normal record. Otherwise it's one of
+    the "drift" sub-dicts above — see the bug-fix note for the transform keys.
+    """
+    record = {k: gen() for k, gen in normal_schema.items()}
+    if not drift_spec:
+        return record
+
+    for old_name, new_name in drift_spec.get("rename", {}).items():
+        if old_name in record:
+            record[new_name] = record.pop(old_name)
+    for name, gen in drift_spec.get("override", {}).items():
+        record[name] = gen()
+    for name in drift_spec.get("drop", []):
+        record.pop(name, None)
+    for name, gen in drift_spec.get("add", {}).items():
+        record[name] = gen()
+    return record
 
 
 def main() -> None:
@@ -98,9 +152,8 @@ def main() -> None:
 
     for i in range(1, args.total_messages + 1):
         use_drift = i > args.drift_after
-        record = generate_record(
-            schema.get(args.drift_type, schema["normal"]) if use_drift else schema["normal"]
-        )
+        drift_spec = schema["drift"][args.drift_type] if use_drift else None
+        record = generate_record(schema["normal"], drift_spec)
 
         envelope = {
             "vendor_id":      args.vendor,

@@ -12,7 +12,7 @@ COPY . .
 
 # PYTHONPATH tells Python where to find modules at import time.
 # /app          → schema_comparator.py, event_publisher.py, detector.py
-# /app/spark_jobs/streaming → config.py, schema_infer.py, kafka_drift_job.py
+# /app/spark_jobs/streaming → config.py, schema_infer.py, pubsub_drift_job.py
 #                             (these are bind-mounted at runtime via docker-compose)
 # /app/data_contracts       → pydantic_contract.py
 #                             (also bind-mounted at runtime)

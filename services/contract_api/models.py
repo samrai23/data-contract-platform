@@ -113,6 +113,27 @@ class VendorRegistrationRequest(BaseModel):
         return v
 
 
+class ContractHealRequest(BaseModel):
+    """
+    Request body for PATCH /api/v1/contracts/{vendor_id}/heal.
+
+    Sent by the agent engine's execute_auto_heal() node after Gemini returns
+    an AUTO_HEAL decision. This is what actually applies the drift to the
+    stored contract and bumps its version — previously execute_auto_heal()
+    only logged the event and approved it without touching contract_json.
+
+    drift_type / field_name / old_type / new_type mirror the DriftEvent
+    payload published by event_publisher.py, so the caller can pass the
+    drift event straight through without reshaping it.
+    """
+
+    drift_type: Literal["type_change", "new_column", "dropped_column", "column_rename"]
+    field_name: str  # bare name, or "old_name → new_name" for column_rename
+    old_type: Optional[FieldType] = None
+    new_type: Optional[FieldType] = None
+    healed_by: str = "gemini-agent"
+
+
 class ApprovalRequest(BaseModel):
     """
     Request body for POST /api/v1/approve/{event_id}.

@@ -35,18 +35,27 @@ from typing import Optional
 import structlog
 from fastapi import APIRouter, HTTPException, Query
 from google.cloud import bigquery
+from pydantic import ValidationError
 
 from dependencies import BQClient, DatasetRef
 from models import (
     ApprovalRequest,
     ApprovalResponse,
     ContractFieldResponse,
+    ContractHealRequest,
     ContractResponse,
     DriftLogEntry,
     HealthResponse,
     VendorListItem,
     VendorRegistrationRequest,
 )
+
+# Domain model (data_contracts/templates/pydantic_contract.py) — importable because
+# the contract-api Dockerfile puts data_contracts/templates on PYTHONPATH.
+# This is the ONE place in contract-api that touches the domain model directly:
+# the heal endpoint is the "contract writer" — it owns version-bump business logic
+# (bump_minor/bump_major), which the simpler API-facing models.py deliberately omits.
+from pydantic_contract import VendorContract, VendorContractField
 
 log = structlog.get_logger(__name__)
 router = APIRouter()
@@ -268,6 +277,185 @@ def get_contract(
         owner_email=row.owner_email,
         created_at=row.created_at,
         updated_at=row.updated_at,
+    )
+
+
+# ── PATCH /contracts/{vendor_id}/heal ──────────────────────────────────────────
+
+@router.patch(
+    "/contracts/{vendor_id}/heal",
+    response_model=ContractResponse,
+    summary="Apply an auto-healed drift to the stored contract and bump its version",
+)
+def heal_contract(
+    vendor_id: str,
+    body: ContractHealRequest,
+    bq: BQClient,
+    dataset: DatasetRef,
+) -> ContractResponse:
+    """
+    Apply one auto-healed drift event to the stored contract's field list and
+    bump the semantic version — the piece execute_auto_heal() was previously
+    missing (it only logged the event and approved it, contract_json never
+    changed, so the next batch would flag the same field as "drift" again).
+
+    Only called by the agent engine, and only after Gemini returns AUTO_HEAL —
+    which schema_comparator.py only ever marks is_safe_to_auto_heal=True for
+    type_change (widening) and new_column. dropped_column and column_rename are
+    handled here too for completeness (so this endpoint is correct standalone),
+    but in the current graph they always route to ESCALATE, never here.
+
+    WHY DML UPDATE (same exception as POST /approve/{event_id}):
+    This modifies fields on an EXISTING row (contract_json, version). Batch
+    load is append-only and cannot update a row that's already there, so DML
+    is the only option. This requires billing enabled on the BigQuery project
+    — same requirement the approve endpoint already has. Cost is a few KB
+    scanned on a table with a handful of rows, effectively $0.
+    """
+    # ── Step 1: fetch the current active contract row ─────────────────────────
+    query = f"""
+        SELECT *
+        FROM `{dataset}.vendor_contracts`
+        WHERE vendor_id = @vendor_id AND status = 'ACTIVE'
+        LIMIT 1
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("vendor_id", "STRING", vendor_id)
+        ]
+    )
+    rows = list(bq.query(query, job_config=job_config).result())
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No active contract found for vendor '{vendor_id}'. Cannot heal a contract that doesn't exist.",
+        )
+    row = rows[0]
+
+    # Deserialise the stored fields and validate them through the domain model
+    # (the same VendorContractField/VendorContract classes register_vendor's
+    # data passed through implicitly via the API models' validators).
+    try:
+        stored_fields = [VendorContractField(**f) for f in json.loads(row.contract_json)]
+    except (ValidationError, json.JSONDecodeError) as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Stored contract for '{vendor_id}' failed to parse: {exc}",
+        ) from exc
+
+    # ── Step 2: apply the drift to the field list ──────────────────────────────
+    updated_fields = list(stored_fields)
+
+    try:
+        if body.drift_type == "type_change":
+            idx = next((i for i, f in enumerate(updated_fields) if f.name == body.field_name), None)
+            if idx is None:
+                raise HTTPException(404, f"Field '{body.field_name}' not found — cannot apply type_change heal.")
+            if body.new_type is None:
+                raise HTTPException(422, "type_change heal requires new_type.")
+            old = updated_fields[idx]
+            updated_fields[idx] = VendorContractField(
+                name=old.name, field_type=body.new_type, nullable=old.nullable, description=old.description,
+            )
+
+        elif body.drift_type == "new_column":
+            if any(f.name == body.field_name for f in updated_fields):
+                raise HTTPException(409, f"Field '{body.field_name}' already exists — cannot add it as new_column.")
+            if body.new_type is None:
+                raise HTTPException(422, "new_column heal requires new_type.")
+            updated_fields.append(VendorContractField(
+                name=body.field_name, field_type=body.new_type, nullable=True,
+                description="Auto-added by heal (detected as new_column drift).",
+            ))
+
+        elif body.drift_type == "dropped_column":
+            before = len(updated_fields)
+            updated_fields = [f for f in updated_fields if f.name != body.field_name]
+            if len(updated_fields) == before:
+                raise HTTPException(404, f"Field '{body.field_name}' not found — cannot apply dropped_column heal.")
+
+        elif body.drift_type == "column_rename":
+            # schema_comparator.py formats rename field_name as "old_name → new_name"
+            parts = body.field_name.split(" → ")
+            if len(parts) != 2:
+                raise HTTPException(422, f"column_rename field_name must be 'old → new', got '{body.field_name}'.")
+            old_name, new_name = parts
+            idx = next((i for i, f in enumerate(updated_fields) if f.name == old_name), None)
+            if idx is None:
+                raise HTTPException(404, f"Field '{old_name}' not found — cannot apply column_rename heal.")
+            old = updated_fields[idx]
+            updated_fields[idx] = VendorContractField(
+                name=new_name, field_type=old.field_type, nullable=old.nullable, description=old.description,
+            )
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=f"Healed field failed validation: {exc}") from exc
+
+    # ── Step 3: rebuild + validate the full contract, then bump the version ────
+    # Constructing (not model_copy) re-runs no_duplicate_field_names — model_copy
+    # would skip validators and could silently accept a bad rename/collision.
+    try:
+        candidate = VendorContract(
+            vendor_id=row.vendor_id,
+            version=row.version,
+            fields=[f.model_dump() for f in updated_fields],
+            description=row.description or "",
+            owner_email=row.owner_email or "",
+        )
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=f"Healed contract failed validation: {exc}") from exc
+
+    # Additive, non-breaking changes → minor bump. Structural/breaking → major bump.
+    # (In practice only type_change/new_column reach this endpoint via AUTO_HEAL —
+    # dropped_column/column_rename are always ESCALATE — but the rule holds either way.)
+    if body.drift_type in ("type_change", "new_column"):
+        healed = candidate.bump_minor()
+    else:
+        healed = candidate.bump_major()
+
+    # ── Step 4: persist via DML UPDATE (see docstring for why not batch load) ──
+    # mode="json" forces field_type (a str Enum) to serialise as its plain string
+    # value rather than relying on Enum-as-str coercion.
+    new_contract_json = json.dumps([f.model_dump(mode="json") for f in healed.fields])
+    now = datetime.now(timezone.utc)
+
+    update_query = f"""
+        UPDATE `{dataset}.vendor_contracts`
+        SET
+            contract_json = @contract_json,
+            version       = @version,
+            updated_at    = @updated_at
+        WHERE vendor_id = @vendor_id AND status = 'ACTIVE'
+    """
+    update_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("contract_json", "STRING", new_contract_json),
+            bigquery.ScalarQueryParameter("version", "STRING", healed.version),
+            bigquery.ScalarQueryParameter("updated_at", "TIMESTAMP", now.isoformat()),
+            bigquery.ScalarQueryParameter("vendor_id", "STRING", vendor_id),
+        ]
+    )
+    bq.query(update_query, job_config=update_config).result()
+
+    log.info(
+        "heal_contract.ok",
+        vendor_id=vendor_id,
+        drift_type=body.drift_type,
+        field_name=body.field_name,
+        old_version=row.version,
+        new_version=healed.version,
+        healed_by=body.healed_by,
+    )
+
+    return ContractResponse(
+        vendor_id=row.vendor_id,
+        vendor_name=row.vendor_name,
+        version=healed.version,
+        status="ACTIVE",
+        fields=[ContractFieldResponse(**f.model_dump(mode="json")) for f in healed.fields],
+        description=row.description or "",
+        owner_email=row.owner_email or "",
+        created_at=row.created_at,
+        updated_at=now,
     )
 
 

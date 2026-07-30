@@ -210,7 +210,7 @@ def infer_schema_from_batch(messages: list[str]) -> IncomingSchema:
     Parameters
     ----------
     messages : list[str]
-        Raw UTF-8 JSON strings from Kafka, one per message.
+        Raw UTF-8 JSON strings from Pub/Sub, one per message.
         Each message must be a JSON object (dict), not an array or scalar.
 
     Returns
